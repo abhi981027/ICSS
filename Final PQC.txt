@@ -1,0 +1,106 @@
+Final PQC
+
+cd ~
+
+wget https://github.com/openssl/openssl/releases/download/openssl-3.4.0/openssl-3.4.0.tar.gz
+
+tar xf openssl-3.4.0.tar.gz
+
+cd openssl-3.4.0/
+
+sudo apt-get update
+
+sudo apt-get install build-essential
+
+./Configure --prefix=/opt/openssl --openssldir=/opt/openssl enable-fips
+
+make -j
+
+sudo make install
+
+export LD_LIBRARY_PATH=/opt/openssl/lib64/
+
+/opt/openssl/bin/openssl version -a
+
+nano ~/.profile
+
+export PATH=/opt/openssl/bin:$PATH
+export LD_LIBRARY_PATH=/opt/openssl/lib64
+
+sudo openssl fipsinstall -out /opt/openssl/fipsmodule.cnf -module /opt/openssl/lib64/ossl-modules/fips.so
+
+cd ~
+
+sudo apt install astyle cmake gcc ninja-build libssl-dev python3-pytest python3-pytest-xdist unzip xsltproc doxygen graphviz python3-yaml valgrind git
+
+git clone -b main https://github.com/open-quantum-safe/liboqs.git
+
+cd liboqs
+
+cd liboqs
+
+mkdir build && cd build
+
+cmake -GNinja ..
+
+ninja
+
+ninja run_tests
+
+sudo ninja install
+
+sudo apt install cmake git
+
+cd ~
+
+git clone https://github.com/open-quantum-safe/oqs-provider.git
+
+cd oqs-provider/
+
+liboqs_DIR=/home/vboxuser/liboqs cmake -DOPENSSL_ROOT_DIR=/opt/openssl -S . -B _build && sudo cmake --build _build && sudo cmake --install _build
+
+cd _build && ctest --parallel 5 --rerun-failed --output-on-failure -V
+
+cd /opt/openssl/
+
+sudo nano openssl.cnf
+
+# List of providers to load
+[provider_sect]
+default = default_sect
+legacy = legacy_sect
+fips=fips_sect
+oqsprovider = oqsprovider_sect
+
+
+[default_sect]
+activate = 1
+
+[legacy_sect]
+activate = 1
+
+[fips_sect]
+activate = 1
+
+[oqsprovider_sect]
+activate = 1
+
+# Cerificate creation
+
+vboxuser@oqs:~$ openssl req -x509 -new -newkey p256_mldsa44 -keyout p256_mldsa44_CA.key -out p256_mldsa44_CA.crt -nodes -subj "/CN=test CA" -days 365 -provider-path /home/vboxuser/oqs-provider -provider default -provider oqsprovider
+vboxuser@oqs:~$ openssl genpkey -algorithm p256_mldsa44 -out p256_mldsa44_srv.key
+vboxuser@oqs:~$ openssl req -new -newkey p256_mldsa44 -keyout p256_mldsa44_srv.key -out p256_mldsa44_srv.csr -nodes -subj "/CN=test server" -provider-path /home/vboxuser/oqs-provider -provider default -provider oqsprovider
+vboxuser@oqs:~$ Usage instructions for oqsprovider
+vboxuser@oqs:~$ openssl req -new -newkey p256_mldsa44 -keyout p256_mldsa44_srv.kvboxuser@oqs:~$ openssl x509 -req -in p256_mldsa44_srv.csr -out p256_mldsa44_srv.crt -CA p256_mldsa44_CA.crt -CAkey p256_mldsa44_CA.key -CAcreateserial -days 365
+
+vboxuser@oqs:~$ openssl s_server -cert p256_mldsa44_srv.crt -key p256_mldsa44_srv.key -www -tls1_3 -groups X25519MLKEM768 -provider oqsprovider
+
+vboxuser@oqs:~$ openssl s_client -connect localhost:4433 -groups X25519MLKEM768 -provider oqsprovider
+vboxuser@oqs:~$ openssl s_client -connect fonts.google.com:443 -groups X25519MLKEM768 -provider oqsprovider
+
+
+openssl s_client -connect fonts.google.com:443 -groups X25519MLKEM768 -provider oqsprovider -brief
+
+export SSLKEYLOGFILE=/home/vboxuser/keylog.key
+
+sudo apt install wireshark

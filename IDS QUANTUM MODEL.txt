@@ -1,0 +1,1462 @@
+try:
+    import cirq
+    import cirq_google
+except ImportError:
+    print("installing cirq...")
+    !pip install --quiet cirq-google~=1.0.dev
+    print("installed cirq.")
+    import cirq
+    import cirq_google
+pip install numpy cirq xgboost scikit-learn tensorflow matplotlib pandas
+#----------------First Model---------------------------------------------------------------------------------
+# ------------------- IMPORTS -------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import cirq
+import time
+import joblib
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.kernel_approximation import RBFSampler
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, precision_recall_curve
+from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from lightgbm import LGBMClassifier
+from imblearn.over_sampling import SMOTE
+from functools import partial
+import multiprocessing as mp
+import warnings
+warnings.filterwarnings('ignore')
+
+# ------------------- CONFIG -------------------
+np.random.seed(42)
+train_path = '/content/Train_data.csv'
+test_path = '/content/Test_data.csv'
+target_column = 'class'
+categorical_columns = ['protocol_type', 'service', 'flag']
+N_JOBS = max(1, mp.cpu_count() - 1)  # Use all but one CPU cores
+CACHE_DIR = './model_cache'  # Directory to cache intermediate results
+
+# ------------------- UTILITY FUNCTIONS -------------------
+
+def timing_decorator(func):
+    """Decorator to time function execution"""
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} executed in {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper
+
+def save_to_cache(obj, filename):
+    """Save object to cache"""
+    import os
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+    joblib.dump(obj, f"{CACHE_DIR}/{filename}")
+
+def load_from_cache(filename):
+    """Load object from cache if exists"""
+    import os
+    path = f"{CACHE_DIR}/{filename}"
+    if os.path.exists(path):
+        return joblib.load(path)
+    return None
+
+# ------------------- DATA PREPROCESSING -------------------
+
+@timing_decorator
+def optimized_preprocess_data(train_df, test_df, target_column, categorical_columns):
+    """Optimized preprocessing with efficient handling of categorical variables and outliers"""
+    print("Optimized preprocessing data...")
+
+    # Check if preprocessed data is in cache
+    cached_data = load_from_cache("preprocessed_data.pkl")
+    if cached_data is not None:
+        print("Loaded preprocessed data from cache")
+        return cached_data
+
+    # First, verify that all required columns exist in the dataframes
+    for col in categorical_columns + [target_column]:
+        if col not in train_df.columns:
+            raise KeyError(f"Column '{col}' not found in training data")
+
+    for col in categorical_columns:
+        if col not in test_df.columns:
+            raise KeyError(f"Column '{col}' not found in test data")
+
+    # Extract target
+    y_train = train_df[target_column].apply(lambda x: 1 if x != 'normal' else 0)
+
+    # Handle non-categorical columns
+    numeric_columns = [col for col in train_df.columns if col not in categorical_columns + [target_column]]
+
+    # Advanced: Feature selection based on correlation with target
+    if len(numeric_columns) > 10:  # Only if we have many numeric features
+        corr_with_target = {}
+        for col in numeric_columns:
+            corr_with_target[col] = abs(np.corrcoef(train_df[col].values, y_train.values)[0, 1])
+
+        # Sort columns by correlation and keep top 90%
+        sorted_columns = sorted(corr_with_target.items(), key=lambda x: x[1], reverse=True)
+        threshold = sorted_columns[int(len(sorted_columns) * 0.9)][1]
+        selected_numeric = [col for col, corr in corr_with_target.items() if corr >= threshold]
+        print(f"Selected {len(selected_numeric)}/{len(numeric_columns)} numeric features based on correlation")
+        numeric_columns = selected_numeric
+
+    # Handle outliers more efficiently using vectorized operations
+    train_numeric = train_df[numeric_columns].copy()
+    test_numeric = test_df[numeric_columns].copy()
+
+    # Faster outlier removal with vectorized operations
+    Q1 = train_numeric.quantile(0.01)
+    Q3 = train_numeric.quantile(0.99)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+
+    # Create mask for valid rows
+    outlier_mask = ~((train_numeric < lower_bound) | (train_numeric > upper_bound)).any(axis=1)
+    train_df_filtered = train_df.loc[outlier_mask]
+    y_train = y_train[outlier_mask]
+    train_numeric = train_numeric[outlier_mask]
+
+    # Cap outliers in test set instead of removing
+    for col in numeric_columns:
+        test_numeric[col] = np.clip(test_numeric[col], lower_bound[col], upper_bound[col])
+
+    # Optimized categorical feature handling
+    # Use memory-efficient one-hot encoding
+    encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=True)
+    X_train_cat = encoder.fit_transform(train_df_filtered[categorical_columns])
+    X_test_cat = encoder.transform(test_df[categorical_columns])
+
+    # Apply robust scaling to numeric features
+    scaler = StandardScaler()
+    X_train_num_scaled = scaler.fit_transform(train_numeric)
+    X_test_num_scaled = scaler.transform(test_numeric)
+
+    # Combine numeric and categorical features efficiently
+    from scipy import sparse
+    X_train_scaled = sparse.hstack([sparse.csr_matrix(X_train_num_scaled), X_train_cat]).toarray()
+    X_test_scaled = sparse.hstack([sparse.csr_matrix(X_test_num_scaled), X_test_cat]).toarray()
+
+    print(f"Optimized preprocessing completed. Training data shape: {X_train_scaled.shape}")
+    print(f"Test data shape: {X_test_scaled.shape}")
+
+    # Cache the results
+    result = (X_train_scaled, X_test_scaled, y_train)
+    save_to_cache(result, "preprocessed_data.pkl")
+
+    return result
+
+# ------------------- QUANTUM FEATURE MAPPING -------------------
+
+def create_parameterized_quantum_circuit(qubits, n_features):
+    """Create a parameterized quantum circuit template for feature mapping"""
+    import sympy  # Import sympy for Symbol
+    circuit = cirq.Circuit()
+
+    # Initial rotation gates
+    for i, qubit in enumerate(qubits):
+        circuit.append(cirq.rx(sympy.Symbol(f'x_{i}'))(qubit))
+
+    # Entanglement layer
+    for i in range(len(qubits)-1):
+        circuit.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+    # Second rotation layer
+    for i, qubit in enumerate(qubits):
+        circuit.append(cirq.ry(sympy.Symbol(f'y_{i}'))(qubit))
+
+    # Final entanglement layer
+    for i in range(len(qubits)-1):
+        circuit.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+    return circuit
+
+def process_batch_quantum(batch, qubits, circuit_template, simulator):
+    """Process a batch of samples through the quantum circuit"""
+    batch_features = []
+
+    for data_point in batch:
+        # Normalize data point to [-π, π]
+        normalized_data = np.clip(data_point, -1, 1) * np.pi
+
+        # Create parameter dictionary
+        param_dict = {}
+        for i in range(len(qubits)):
+            idx = i % len(normalized_data)
+            param_dict[f'x_{i}'] = normalized_data[idx]
+            param_dict[f'y_{i}'] = normalized_data[idx] * 0.8  # Slightly different angle
+
+        # Resolve the circuit with the parameters
+        resolved_circuit = cirq.resolve_parameters(circuit_template, param_dict)
+
+        # Simulate the circuit
+        result = simulator.simulate(resolved_circuit)
+        state_vector = np.abs(result.final_state_vector)
+
+        # Use state vector as features
+        batch_features.append(state_vector)
+
+    return batch_features
+
+def process_batch_parallel(batch_idx, batches, qubits, circuit_template, simulator):
+    """Process a batch in parallel"""
+    batch = batches[batch_idx]
+    print(f"Processing batch {batch_idx+1}/{len(batches)}")
+    return process_batch_quantum(batch, qubits, circuit_template, simulator)
+
+@timing_decorator
+def optimized_quantum_feature_map(X, num_qubits=8):
+    """Optimized quantum feature mapping with better parallel processing approach"""
+    print("Optimized Quantum Feature Mapping...")
+
+    # Check if quantum features are in cache
+    cache_key = f"quantum_features_{hash(str(X.shape))}_{num_qubits}.pkl"
+    cached_features = load_from_cache(cache_key)
+    if cached_features is not None:
+        print("Loaded quantum features from cache")
+        return cached_features
+
+    # Reduce dimensionality if needed
+    n_features = min(num_qubits, X.shape[1])
+    if X.shape[1] > n_features:
+        print(f"Reducing input dimension from {X.shape[1]} to {n_features}")
+        pca = PCA(n_components=n_features)
+        X = pca.fit_transform(X)
+
+    # Process without multiprocessing
+    quantum_features = []
+
+    # Create quantum circuit on main process
+    import sympy  # Import sympy for Symbol
+    qubits = cirq.LineQubit.range(num_qubits)
+    circuit_template = cirq.Circuit()
+
+    # Initial rotation gates
+    for i, qubit in enumerate(qubits):
+        circuit_template.append(cirq.rx(sympy.Symbol(f'x_{i}'))(qubit))
+
+    # Entanglement layer
+    for i in range(len(qubits)-1):
+        circuit_template.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+    # Second rotation layer
+    for i, qubit in enumerate(qubits):
+        circuit_template.append(cirq.ry(sympy.Symbol(f'y_{i}'))(qubit))
+
+    # Final entanglement layer
+    for i in range(len(qubits)-1):
+        circuit_template.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+    # Create simulator
+    simulator = cirq.Simulator()
+
+    # Process samples sequentially or in small batches
+    batch_size = 100
+    n_samples = X.shape[0]
+    n_batches = int(np.ceil(n_samples / batch_size))
+
+    for batch_idx in range(n_batches):
+        print(f"Processing batch {batch_idx+1}/{n_batches}")
+
+        # Get current batch
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, n_samples)
+        batch = X[start_idx:end_idx]
+
+        batch_features = []
+        for data_point in batch:
+            # Normalize data point to [-π, π]
+            normalized_data = np.clip(data_point, -1, 1) * np.pi
+
+            # Create parameter dictionary
+            param_dict = {}
+            for i in range(len(qubits)):
+                idx = i % len(normalized_data)
+                param_dict[f'x_{i}'] = normalized_data[idx]
+                param_dict[f'y_{i}'] = normalized_data[idx] * 0.8  # Slightly different angle
+
+            # Resolve the circuit with the parameters
+            resolved_circuit = cirq.resolve_parameters(circuit_template, param_dict)
+
+            # Simulate the circuit
+            result = simulator.simulate(resolved_circuit)
+            state_vector = np.abs(result.final_state_vector)
+
+            # Use state vector as features
+            batch_features.append(state_vector)
+
+        quantum_features.extend(batch_features)
+
+    quantum_features = np.array(quantum_features)
+    print(f"Quantum features shape: {quantum_features.shape}")
+
+    # Cache the results
+    save_to_cache(quantum_features, cache_key)
+
+    return quantum_features
+
+# ------------------- FEATURE ENGINEERING -------------------
+
+@timing_decorator
+def optimized_feature_engineering(X_quantum, X_original):
+    """Optimized feature engineering combining quantum and classical features"""
+    print("Optimized feature engineering...")
+
+    # Check cache
+    cache_key = f"engineered_features_{hash(str(X_quantum.shape))}.pkl"
+    cached_features = load_from_cache(cache_key)
+    if cached_features is not None:
+        print("Loaded engineered features from cache")
+        return cached_features
+
+    n_samples = X_quantum.shape[0]
+
+    # Extract quantum statistical features efficiently
+    quantum_stats = np.zeros((n_samples, 6))
+
+    # Vectorized operations for speed
+    # Entropy (approximate for speed)
+    log_probs = np.log(np.maximum(X_quantum**2, 1e-10))
+    entropy = -np.sum(X_quantum**2 * log_probs, axis=1)
+    quantum_stats[:, 0] = entropy
+
+    # Other statistical features
+    quantum_stats[:, 1] = np.max(X_quantum, axis=1)
+    quantum_stats[:, 2] = np.min(X_quantum, axis=1)
+    quantum_stats[:, 3] = np.mean(X_quantum, axis=1)
+    quantum_stats[:, 4] = np.std(X_quantum, axis=1)
+    quantum_stats[:, 5] = np.sum(X_quantum > 0.1, axis=1)  # Count significant amplitudes
+
+    # Select most important original features
+    if X_original.shape[1] > 10:
+        pca_original = PCA(n_components=10)
+        X_original_reduced = pca_original.fit_transform(X_original)
+    else:
+        X_original_reduced = X_original
+
+    # Combine features intelligently
+    X_combined = np.hstack((X_quantum, quantum_stats, X_original_reduced))
+
+    # Cache the results
+    save_to_cache(X_combined, cache_key)
+
+    return X_combined
+
+# ------------------- MODEL TRAINING AND EVALUATION -------------------
+
+@timing_decorator
+def balance_and_optimize_features(X, y, max_features=50):
+    """Balance classes and optimize feature set"""
+    print(f"Balancing and optimizing features...")
+
+    # Check cache
+    cache_key = f"balanced_data_{hash(str(X.shape))}.pkl"
+    cached_data = load_from_cache(cache_key)
+    if cached_data is not None:
+        print("Loaded balanced data from cache")
+        return cached_data
+
+    # Apply PCA with automatic component selection
+    pca = PCA(n_components=min(max_features, X.shape[0], X.shape[1]))
+    X_pca = pca.fit_transform(X)
+
+    # Find optimal number of components based on explained variance
+    explained_variance = np.cumsum(pca.explained_variance_ratio_)
+    n_components = np.argmax(explained_variance >= 0.95) + 1
+    n_components = max(n_components, 3)  # At least 3 components
+
+    print(f"Selected {n_components} PCA components capturing {explained_variance[n_components-1]:.4f} of variance")
+    X_pca = X_pca[:, :n_components]
+
+    # Apply SMOTE more efficiently
+    smote = SMOTE(random_state=42)
+    X_bal, y_bal = smote.fit_resample(X_pca, y)
+
+    print(f"Class distribution after balancing: {np.bincount(y_bal)}")
+
+    # Cache results
+    result = (X_bal, y_bal, pca, n_components)
+    save_to_cache(result, cache_key)
+
+    return result
+
+@timing_decorator
+def train_classical_model(X_rbf, y):
+    """Train a classical XGBoost model on RBF features"""
+    print("Training classical XGBoost model...")
+
+    model = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=8,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+        eval_metric='logloss',
+        random_state=42,
+        n_jobs=N_JOBS
+    )
+
+    model.fit(X_rbf, y)
+    return model
+
+@timing_decorator
+def train_advanced_hybrid_ensemble(X_train, y_train):
+    """Train an advanced hybrid ensemble with multiple model types and optimization"""
+    print("Training advanced hybrid ensemble...")
+
+    # Define base models for direct training (no RBF)
+    models = {
+        'xgb': xgb.XGBClassifier(
+            n_estimators=300,
+            max_depth=8,
+            learning_rate=0.03,
+            subsample=0.9,
+            colsample_bytree=0.8,
+            use_label_encoder=False,
+            eval_metric='logloss',
+            random_state=42,
+            n_jobs=N_JOBS
+        ),
+        'rf': RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=5,
+            random_state=42,
+            n_jobs=N_JOBS
+        ),
+        'lgbm': LGBMClassifier(
+            n_estimators=300,
+            learning_rate=0.03,
+            num_leaves=31,
+            random_state=42,
+            n_jobs=N_JOBS
+        )
+    }
+
+    # Train models directly on input features
+    trained_models = {}
+    for name, model in models.items():
+        print(f"Training {name}...")
+        model.fit(X_train, y_train)
+        trained_models[name] = model
+
+    # Create meta-ensemble
+    ensemble = VotingClassifier(
+        estimators=[(name, model) for name, model in trained_models.items()],
+        voting='soft'
+    )
+
+    # Train the ensemble directly on input features
+    ensemble.fit(X_train, y_train)
+
+    return ensemble, trained_models
+
+@timing_decorator
+def evaluate_model(model, X, y, title='Model'):
+    """Evaluate model performance with comprehensive metrics"""
+    print(f"Evaluating: {title}")
+
+    # Get predictions directly on input features
+    y_pred = model.predict(X)
+    y_prob = model.predict_proba(X)[:, 1]
+
+    # Calculate metrics
+    acc = accuracy_score(y, y_pred)
+    auc = roc_auc_score(y, y_prob)
+
+    print(f"\nAccuracy: {acc:.4f}")
+    print(f"AUC-ROC: {auc:.4f}")
+    print("\nClassification Report:\n", classification_report(y, y_pred))
+
+    # Visualize results
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Plot accuracy and AUC
+    metrics = ['Accuracy', 'AUC-ROC']
+    values = [acc, auc]
+    ax1.bar(metrics, values, color=['teal', 'navy'])
+    ax1.set_title(f'{title} Performance Metrics')
+    ax1.set_ylim(0, 1)
+    ax1.grid(axis='y', alpha=0.3)
+
+    for i, v in enumerate(values):
+        ax1.text(i, v + 0.02, f'{v:.4f}', ha='center')
+
+    # Plot precision-recall curve
+    precision, recall, _ = precision_recall_curve(y, y_prob)
+    ax2.plot(recall, precision, 'b-', linewidth=2)
+    ax2.set_title('Precision-Recall Curve')
+    ax2.set_xlabel('Recall')
+    ax2.set_ylabel('Precision')
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    return acc, auc, y_pred, y_prob
+
+# ------------------- MAIN EXECUTION -------------------
+
+def run_hybrid_ml_pipeline():
+    """Run the complete optimized hybrid quantum-classical ML pipeline"""
+    start_time = time.time()
+    print("Starting Hybrid Quantum-Classical ML Pipeline...")
+
+    # Step 1: Load Data
+    print("\n=== Loading data ===")
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+    print(f"Train shape: {train_df.shape}")
+    print(f"Test shape: {test_df.shape}")
+
+    # Step 2: Optimized Preprocessing
+    print("\n=== Preprocessing ===")
+    try:
+        X_train, X_test, y_train = optimized_preprocess_data(
+            train_df, test_df, target_column, categorical_columns
+        )
+    except Exception as e:
+        print(f"Error during preprocessing: {e}")
+        raise
+
+    # First train a classical model for comparison
+    print("\n=== Training Classical Baseline Model ===")
+    X_train_bal, y_train_bal, pca_classical, _ = balance_and_optimize_features(X_train, y_train)
+    X_test_pca_classical = pca_classical.transform(X_test)
+
+    # Train classical model directly on balanced features
+    classical_model = train_classical_model(X_train_bal, y_train_bal)
+
+    # Step 3: Quantum Feature Mapping
+    print("\n=== Quantum Feature Mapping ===")
+    X_train_quantum = optimized_quantum_feature_map(X_train, num_qubits=min(8, X_train.shape[1]))
+    X_test_quantum = optimized_quantum_feature_map(X_test, num_qubits=min(8, X_test.shape[1]))
+
+    # Step 4: Feature Engineering
+    print("\n=== Feature Engineering ===")
+    X_train_enhanced = optimized_feature_engineering(X_train_quantum, X_train)
+    X_test_enhanced = optimized_feature_engineering(X_test_quantum, X_test)
+
+    # Step 5: Balance and Optimize Features
+    print("\n=== Balancing and Feature Optimization ===")
+    X_train_final, y_train_final, pca_model, n_components = balance_and_optimize_features(X_train_enhanced, y_train)
+    X_test_final = pca_model.transform(X_test_enhanced)[:, :n_components]
+
+    # Step 6: Train Advanced Hybrid Ensemble
+    print("\n=== Training Hybrid Ensemble ===")
+    hybrid_ensemble, trained_models = train_advanced_hybrid_ensemble(X_train_final, y_train_final)
+
+    # Step 7: Evaluate Models
+    print("\n=== Evaluating Models ===")
+    # Evaluate Classical Model
+    classical_acc, classical_auc, _, _ = evaluate_model(
+        classical_model, X_train_bal, y_train_bal,
+        title='Classical XGBoost'
+    )
+
+    # Evaluate Hybrid Model
+    quantum_acc, quantum_auc, _, _ = evaluate_model(
+        hybrid_ensemble, X_train_final, y_train_final,
+        title='Hybrid Quantum-Classical Ensemble'
+    )
+
+    # Step 8: Compare Models
+    print("\n=== Model Comparison ===")
+    plt.figure(figsize=(10, 6))
+    models = ['Classical Model', 'Hybrid Quantum-Classical']
+    metrics = {
+        'Accuracy': [classical_acc, quantum_acc],
+        'AUC-ROC': [classical_auc, quantum_auc]
+    }
+
+    x = np.arange(len(models))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - width/2, metrics['Accuracy'], width, label='Accuracy', color='teal')
+    ax.bar(x + width/2, metrics['AUC-ROC'], width, label='AUC-ROC', color='navy')
+
+    ax.set_title('Model Performance Comparison', fontsize=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels(models)
+    ax.set_ylim(0.8, 1.0)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+
+    # Add values on bars
+    for i, model in enumerate(models):
+        for j, metric in enumerate(['Accuracy', 'AUC-ROC']):
+            ax.text(i + (j-0.5)*width, metrics[metric][i] + 0.01,
+                    f'{metrics[metric][i]:.4f}',
+                    ha='center', va='bottom')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Step 9: Generate Predictions on Test Set
+    print("\n=== Generating Test Predictions ===")
+    test_preds = hybrid_ensemble.predict(X_test_final)
+    test_probs = hybrid_ensemble.predict_proba(X_test_final)[:, 1]
+
+    # Save predictions
+    output_df = pd.DataFrame({
+        'Prediction': test_preds,
+        'Probability': test_probs
+    })
+    output_df.to_csv('optimized_hybrid_predictions.csv', index=False)
+    print("Predictions saved to 'optimized_hybrid_predictions.csv'")
+
+    # Print execution summary
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"\n=== Pipeline Execution Summary ===")
+    print(f"Total execution time: {total_time:.2f} seconds")
+    print(f"Improvement with Hybrid model: {(quantum_acc - classical_acc) * 100:.2f}% accuracy")
+    print(f"Improvement with Hybrid model: {(quantum_auc - classical_auc) * 100:.2f}% AUC-ROC")
+
+# Run the pipeline
+if __name__ == "__main__":
+    run_hybrid_ml_pipeline()
+#------------------------------Second Model----------------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import xgboost as xgb
+import cirq
+import time
+import joblib
+import seaborn as sns
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, confusion_matrix
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from lightgbm import LGBMClassifier
+from imblearn.over_sampling import SMOTE
+from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, TransformerMixin
+import warnings
+warnings.filterwarnings('ignore')
+
+# ------------------- CONFIG -------------------
+np.random.seed(42)
+target_column = 'class'
+categorical_columns = ['protocol_type', 'service', 'flag']
+
+# ------------------- UTILITY FUNCTIONS -------------------
+
+class OutlierRemover(BaseEstimator, TransformerMixin):
+    """Custom transformer to remove outliers using IQR method"""
+    def __init__(self, quantile_range=(0.01, 0.99)):
+        self.quantile_range = quantile_range
+        self.lower_bound = None
+        self.upper_bound = None
+
+    def fit(self, X, y=None):
+        Q1 = np.percentile(X, self.quantile_range[0] * 100, axis=0)
+        Q3 = np.percentile(X, self.quantile_range[1] * 100, axis=0)
+        IQR = Q3 - Q1
+        self.lower_bound = Q1 - 1.5 * IQR
+        self.upper_bound = Q3 + 1.5 * IQR
+        return self
+
+    def transform(self, X):
+        X_copy = X.copy()
+        for i in range(X.shape[1]):
+            X_copy[:, i] = np.clip(X_copy[:, i], self.lower_bound[i], self.upper_bound[i])
+        return X_copy
+
+def timing_decorator(func):
+    """Decorator to time function execution"""
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} executed in {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper
+
+# ------------------- DATA LOADING AND PREPARATION -------------------
+
+@timing_decorator
+def load_data(train_path, test_path):
+    """Load data and perform initial exploration"""
+    print("Loading data...")
+
+    # Load data
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+
+    print(f"Train shape: {train_df.shape}")
+    print(f"Test shape: {test_df.shape}")
+
+    # Debug: Print all columns
+    print("\nTrain columns:", train_df.columns.tolist())
+    print("Test columns:", test_df.columns.tolist())
+
+    # Check class distribution
+    if target_column in train_df.columns:
+        print("\nClass distribution in training data:")
+        print(train_df[target_column].value_counts())
+        print(f"Class balance: {train_df[target_column].value_counts(normalize=True)}")
+
+    # Basic data info
+    print("\nData types:")
+    print(train_df.dtypes.value_counts())
+
+    # Check for missing values
+    print("\nMissing values in train set:")
+    print(train_df.isnull().sum().sum())
+    print("\nMissing values in test set:")
+    print(test_df.isnull().sum().sum())
+
+    return train_df, test_df
+
+@timing_decorator
+def prepare_data_splits(train_df, test_df, target_column):
+    """Create properly stratified data splits to prevent data leakage"""
+    print("Creating data splits...")
+
+    # Check if target column exists in train
+    if target_column not in train_df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in training data")
+
+    # For test data, check if it has the target column
+    test_has_target = target_column in test_df.columns
+
+    # Split training data
+    X = train_df.drop(columns=[target_column])
+    y = train_df[target_column].apply(lambda x: 1 if x != 'normal' else 0)
+
+    # Create stratified split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Validation set: {X_val.shape[0]} samples")
+    print(f"Test set: {test_df.shape[0]} samples")
+
+    # Class distribution in splits
+    print("\nClass distribution:")
+    print(f"Training: {np.bincount(y_train)}")
+    print(f"Validation: {np.bincount(y_val)}")
+
+    # Return test_df without modification if it doesn't have target column
+    if not test_has_target:
+        return X_train, X_val, test_df, y_train, y_val, None
+
+    # If test has target, split it
+    X_test = test_df.drop(columns=[target_column])
+    y_test = test_df[target_column].apply(lambda x: 1 if x != 'normal' else 0)
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+# ------------------- PREPROCESSING -------------------
+
+class Preprocessor:
+    """Class to handle all preprocessing to prevent data leakage"""
+    def __init__(self, categorical_columns):
+        self.categorical_columns = categorical_columns
+        self.cat_transformer = None
+        self.num_transformer = None
+        self.pca = None
+        self.fitted = False
+
+    @timing_decorator
+    def fit(self, X_train):
+        """Fit all transformers on training data only"""
+        print("Fitting preprocessing pipeline...")
+
+        # Create and fit categorical transformer
+        self.cat_transformer = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+        X_train_cat = X_train[self.categorical_columns].values
+        self.cat_transformer.fit(X_train_cat)
+
+        # Create and fit numeric transformer
+        self.num_transformer = Pipeline(steps=[
+            ('outlier_remover', OutlierRemover()),
+            ('scaler', StandardScaler())
+        ])
+        X_train_num = X_train.drop(columns=self.categorical_columns).values
+        self.num_transformer.fit(X_train_num)
+
+        # Fit PCA on training data if needed
+        self.pca = PCA(n_components=0.95)  # Keep 95% variance
+        X_train_num_transformed = self.num_transformer.transform(X_train_num)
+        self.pca.fit(X_train_num_transformed)
+
+        self.fitted = True
+        return self
+
+    @timing_decorator
+    def transform(self, X, batch_size=100):
+        """Transform data using fitted transformers"""
+        if not self.fitted:
+            raise RuntimeError("Preprocessor must be fitted before transforming data")
+
+        print("Transforming data...")
+
+        # Transform categorical features
+        X_cat = X[self.categorical_columns].values
+        X_cat_transformed = self.cat_transformer.transform(X_cat)
+
+        # Transform numeric features
+        X_num = X.drop(columns=self.categorical_columns).values
+        X_num_transformed = self.num_transformer.transform(X_num)
+
+        # Apply PCA to numeric features
+        X_num_pca = self.pca.transform(X_num_transformed)
+
+        # Combine features
+        X_transformed = np.hstack([X_num_pca, X_cat_transformed])
+
+        print(f"Transformed data shape: {X_transformed.shape}")
+        return X_transformed
+
+# ------------------- QUANTUM FEATURE MAPPING -------------------
+
+class QuantumFeatureMapper:
+    """Class to handle quantum feature mapping with proper state management"""
+    def __init__(self, circuit_type='basic', num_qubits=8):
+        self.circuit_type = circuit_type
+        self.num_qubits = num_qubits
+        self.circuit_template = None
+        self.pca = None
+        self.fitted = False
+
+    def _create_circuit(self):
+        """Create quantum circuit template"""
+        import sympy
+        qubits = cirq.LineQubit.range(self.num_qubits)
+        circuit = cirq.Circuit()
+
+        if self.circuit_type == 'basic':
+            # Layer 1: Rotation gates
+            for i, qubit in enumerate(qubits):
+                circuit.append(cirq.rx(sympy.Symbol(f'x_{i}'))(qubit))
+
+            # Entanglement layer
+            for i in range(len(qubits)-1):
+                circuit.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+            # Layer 2: Rotation gates
+            for i, qubit in enumerate(qubits):
+                circuit.append(cirq.ry(sympy.Symbol(f'y_{i}'))(qubit))
+
+        elif self.circuit_type == 'advanced':
+            # Layer 1: Hadamard gates for superposition
+            for qubit in qubits:
+                circuit.append(cirq.H(qubit))
+
+            # Layer 2: Rotation gates
+            for i, qubit in enumerate(qubits):
+                circuit.append(cirq.rx(sympy.Symbol(f'x_{i}'))(qubit))
+
+            # Layer 3: Entanglement - nearest neighbor
+            for i in range(len(qubits)-1):
+                circuit.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+            # Layer 4: Second rotation
+            for i, qubit in enumerate(qubits):
+                circuit.append(cirq.ry(sympy.Symbol(f'y_{i}'))(qubit))
+
+            # Layer 5: Rotation Z
+            for i, qubit in enumerate(qubits):
+                circuit.append(cirq.rz(sympy.Symbol(f'z_{i}'))(qubit))
+
+            # Layer 6: Second entanglement - different connectivity
+            for i in range(0, len(qubits)-1, 2):
+                if i+1 < len(qubits):
+                    circuit.append(cirq.CZ(qubits[i], qubits[i+1]))
+
+        return circuit
+
+    @timing_decorator
+    def fit(self, X_train):
+        """Fit PCA for dimensionality reduction if needed"""
+        print("Fitting quantum feature mapper...")
+
+        # Create circuit template
+        self.circuit_template = self._create_circuit()
+
+        # Fit PCA for dimensionality reduction
+        if X_train.shape[1] > self.num_qubits:
+            self.pca = PCA(n_components=self.num_qubits)
+            self.pca.fit(X_train)
+
+        self.fitted = True
+        return self
+
+    @timing_decorator
+    def transform(self, X, batch_size=100):
+        """Map classical features to quantum state space"""
+        if not self.fitted:
+            raise RuntimeError("QuantumFeatureMapper must be fitted before transforming data")
+
+        print(f"Quantum Feature Mapping on {X.shape[0]} samples using {self.circuit_type} circuit...")
+
+        # Reduce dimensionality if needed
+        if self.pca is not None:
+            X = self.pca.transform(X)
+
+        # Create simulator
+        simulator = cirq.Simulator()
+
+        # Process in batches to prevent memory issues
+        n_samples = X.shape[0]
+        batch_size = int(batch_size)
+        n_batches = int(np.ceil(n_samples / batch_size))
+        quantum_features = []
+
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, n_samples)
+            batch = X[start_idx:end_idx]
+
+            batch_features = []
+            for data_point in batch:
+                # Normalize data point to range [-π, π]
+                normalized_data = np.clip(data_point, -1, 1) * np.pi
+
+                # Create parameter dictionary
+                param_dict = {}
+                for i in range(self.num_qubits):
+                    idx = i % len(normalized_data)
+                    param_dict[f'x_{i}'] = normalized_data[idx]
+                    param_dict[f'y_{i}'] = normalized_data[idx] * 0.8  # Different angle
+
+                    if self.circuit_type == 'advanced':
+                        param_dict[f'z_{i}'] = normalized_data[idx] * 0.6  # Another angle
+
+                # Resolve the circuit with the parameters
+                resolved_circuit = cirq.resolve_parameters(self.circuit_template, param_dict)
+
+                # Simulate the circuit
+                result = simulator.simulate(resolved_circuit)
+                state_vector = np.abs(result.final_state_vector)
+
+                # Use state vector as features
+                batch_features.append(state_vector)
+
+            quantum_features.extend(batch_features)
+
+        quantum_features = np.array(quantum_features)
+        print(f"Quantum features shape: {quantum_features.shape}")
+
+        return quantum_features
+
+@timing_decorator
+def extract_quantum_features(X_quantum):
+    """Extract meaningful features from quantum state vectors"""
+    print("Extracting quantum features...")
+
+    n_samples = X_quantum.shape[0]
+
+    # Extract quantum statistical features
+    features = np.zeros((n_samples, 8))
+
+    # Quantum entropy (von Neumann entropy approximation)
+    log_probs = np.log(np.maximum(X_quantum**2, 1e-10))
+    features[:, 0] = -np.sum(X_quantum**2 * log_probs, axis=1)
+
+    # Statistical features
+    features[:, 1] = np.max(X_quantum, axis=1)
+    features[:, 2] = np.min(X_quantum, axis=1)
+    features[:, 3] = np.mean(X_quantum, axis=1)
+    features[:, 4] = np.std(X_quantum, axis=1)
+    features[:, 5] = np.median(X_quantum, axis=1)
+    features[:, 6] = np.sum(X_quantum > 0.1, axis=1)  # Count significant amplitudes
+
+    # Quadratic feature
+    sorted_probs = np.sort(X_quantum**2, axis=1)
+    features[:, 7] = np.sum(sorted_probs[:, -3:], axis=1)  # Sum of 3 highest probabilities
+
+    print(f"Extracted quantum features shape: {features.shape}")
+
+    return features
+
+# ------------------- MODEL TRAINING AND EVALUATION -------------------
+
+class ModelTrainer:
+    def __init__(self, model_type, param_grid=None):
+        self.model_type = model_type
+        self.param_grid = param_grid or self._get_default_param_grid()
+        self.model = None
+        self.best_params_ = None
+
+    def _get_default_param_grid(self):
+        if self.model_type == 'xgb':
+            return {
+                'max_depth': [3, 5],
+                'learning_rate': [0.01, 0.1],
+                'n_estimators': [100, 200],
+                'subsample': [0.8, 1.0],
+                'colsample_bytree': [0.8, 1.0],
+                'reg_alpha': [0, 0.1],
+                'reg_lambda': [0, 0.1]
+            }
+        elif self.model_type == 'rf':
+            return {
+                'n_estimators': [100, 200],
+                'max_depth': [5, 10, None],
+                'min_samples_split': [2, 5],
+                'min_samples_leaf': [1, 2]
+            }
+        elif self.model_type == 'lgbm':
+            return {
+                'n_estimators': [100, 200],
+                'learning_rate': [0.01, 0.1],
+                'num_leaves': [31, 63],
+                'reg_alpha': [0, 0.1],
+                'reg_lambda': [0, 0.1]
+            }
+
+    def _create_model(self, **params):
+        if self.model_type == 'xgb':
+            return xgb.XGBClassifier(
+                **params,
+                use_label_encoder=False,
+                eval_metric='logloss',
+                random_state=42
+            )
+        elif self.model_type == 'rf':
+            return RandomForestClassifier(**params, random_state=42)
+        elif self.model_type == 'lgbm':
+            return LGBMClassifier(**params, random_state=42)
+
+    @timing_decorator
+    def train(self, X_train, y_train, X_val=None, y_val=None):
+        """Train model with hyperparameter tuning and early stopping"""
+        print(f"Training {self.model_type} model...")
+
+        # Use 3-fold cross-validation to find best parameters
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+        grid_search = GridSearchCV(
+            estimator=self._create_model(),
+            param_grid=self.param_grid,
+            cv=cv,
+            scoring='roc_auc',
+            n_jobs=-1,
+            verbose=1
+        )
+
+        # Fit model with hyperparameter tuning
+        grid_search.fit(X_train, y_train)
+
+        self.best_params_ = grid_search.best_params_
+        print(f"Best parameters: {self.best_params_}")
+        print(f"Best CV score: {grid_search.best_score_:.4f}")
+
+        # Get best model
+        self.model = grid_search.best_estimator_
+
+        # Evaluate on validation set if provided
+        metrics = {}
+        if X_val is not None and y_val is not None:
+            y_val_pred = self.model.predict(X_val)
+            y_val_prob = self.model.predict_proba(X_val)[:, 1]
+
+            val_acc = accuracy_score(y_val, y_val_pred)
+            val_auc = roc_auc_score(y_val, y_val_prob)
+
+            metrics = {
+                'accuracy': val_acc,
+                'auc': val_auc,
+                'confusion_matrix': confusion_matrix(y_val, y_val_pred),
+                'classification_report': classification_report(y_val, y_val_pred)
+            }
+
+            print(f"Validation Accuracy: {val_acc:.4f}")
+            print(f"Validation AUC-ROC: {val_auc:.4f}")
+            print("\nValidation Classification Report:\n", metrics['classification_report'])
+
+        return metrics
+
+    def predict(self, X):
+        """Make predictions using the trained model"""
+        if self.model is None:
+            raise RuntimeError("Model must be trained before making predictions")
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        """Make probability predictions using the trained model"""
+        if self.model is None:
+            raise RuntimeError("Model must be trained before making predictions")
+        return self.model.predict_proba(X)
+
+@timing_decorator
+def balance_dataset(X, y):
+    """Balance dataset with SMOTE"""
+    print("Balancing dataset with SMOTE...")
+
+    # Apply SMOTE to balance classes
+    smote = SMOTE(random_state=42)
+    X_bal, y_bal = smote.fit_resample(X, y)
+
+    print(f"Original class distribution: {np.bincount(y)}")
+    print(f"Balanced class distribution: {np.bincount(y_bal)}")
+
+    return X_bal, y_bal
+
+# ------------------- MODEL TYPES -------------------
+
+@timing_decorator
+def train_classical_model(X_train, y_train, X_val, y_val, model_type='xgb'):
+    """Train a classical machine learning model"""
+    print(f"Training classical {model_type} model...")
+
+    # Balance the training data
+    X_train_bal, y_train_bal = balance_dataset(X_train, y_train)
+
+    # Train the model
+    trainer = ModelTrainer(model_type)
+    metrics = trainer.train(X_train_bal, y_train_bal, X_val, y_val)
+
+    return trainer, metrics, X_val
+
+@timing_decorator
+def train_quantum_augmented_model(X_train, y_train, X_val, y_val,
+                                quantum_mapper, model_type='xgb'):
+    """Train a model with quantum-augmented features"""
+    print(f"Training quantum-augmented {model_type} model...")
+
+    # Generate quantum features
+    X_train_quantum = quantum_mapper.transform(X_train, batch_size=100)
+    X_val_quantum = quantum_mapper.transform(X_val, batch_size=100)
+
+    # Extract quantum features
+    X_train_quantum_features = extract_quantum_features(X_train_quantum)
+    X_val_quantum_features = extract_quantum_features(X_val_quantum)
+
+    # Combine classical and quantum features
+    X_train_combined = np.hstack([X_train, X_train_quantum_features])
+    X_val_combined = np.hstack([X_val, X_val_quantum_features])
+
+    # Balance the training data
+    X_train_combined_bal, y_train_bal = balance_dataset(X_train_combined, y_train)
+
+    # Train the model
+    trainer = ModelTrainer(model_type)
+    metrics = trainer.train(X_train_combined_bal, y_train_bal, X_val_combined, y_val)
+
+    return trainer, metrics, X_val_combined
+
+@timing_decorator
+def train_hybrid_model(X_train, y_train, X_val, y_val,
+                      quantum_mapper, model_type='xgb'):
+    """Train a true hybrid model that uses both raw quantum states and classical features"""
+    print(f"Training hybrid {model_type} model...")
+
+    # Generate quantum features
+    X_train_quantum = quantum_mapper.transform(X_train, batch_size=100)
+    X_val_quantum = quantum_mapper.transform(X_val, batch_size=100)
+
+    # Use raw quantum states combined with classical features
+    quantum_states_flattened = X_train_quantum.reshape(X_train_quantum.shape[0], -1)
+    val_quantum_states_flattened = X_val_quantum.reshape(X_val_quantum.shape[0], -1)
+
+    # Also extract quantum features
+    X_train_quantum_features = extract_quantum_features(X_train_quantum)
+    X_val_quantum_features = extract_quantum_features(X_val_quantum)
+
+    # Combine all feature types
+    X_train_hybrid = np.hstack([X_train, quantum_states_flattened, X_train_quantum_features])
+    X_val_hybrid = np.hstack([X_val, val_quantum_states_flattened, X_val_quantum_features])
+
+    # Initialize PCA to None
+    pca = None
+
+    # Reduce dimensionality if needed (quantum states can be very high-dimensional)
+    if X_train_hybrid.shape[1] > 100:
+        print(f"Reducing hybrid feature dimensions from {X_train_hybrid.shape[1]} to 100")
+        pca = PCA(n_components=100)
+        X_train_hybrid = pca.fit_transform(X_train_hybrid)
+        X_val_hybrid = pca.transform(X_val_hybrid)
+
+    # Balance the training data
+    X_train_hybrid_bal, y_train_bal = balance_dataset(X_train_hybrid, y_train)
+
+    # Train the model
+    trainer = ModelTrainer(model_type)
+    metrics = trainer.train(X_train_hybrid_bal, y_train_bal, X_val_hybrid, y_val)
+
+    return trainer, metrics, X_val_hybrid, pca
+
+@timing_decorator
+def train_pure_quantum_model(X_train, y_train, X_val, y_val,
+                           quantum_mapper, model_type='xgb'):
+    """Train a model using only quantum features"""
+    print(f"Training pure quantum {model_type} model...")
+
+    # Generate quantum features
+    X_train_quantum = quantum_mapper.transform(X_train, batch_size=100)
+    X_val_quantum = quantum_mapper.transform(X_val, batch_size=100)
+
+    # Extract quantum features
+    X_train_quantum_features = extract_quantum_features(X_train_quantum)
+    X_val_quantum_features = extract_quantum_features(X_val_quantum)
+
+    # Balance the training data
+    X_train_quantum_features_bal, y_train_bal = balance_dataset(X_train_quantum_features, y_train)
+
+    # Train the model
+    trainer = ModelTrainer(model_type)
+    metrics = trainer.train(X_train_quantum_features_bal, y_train_bal,
+                          X_val_quantum_features, y_val)
+
+    return trainer, metrics, X_val_quantum_features
+
+# ------------------- EVALUATION AND VISUALIZATION -------------------
+
+def visualize_model_comparison(model_results):
+    """Visualize comparison between different models"""
+    print("Visualizing model comparison...")
+
+    # Set up the plot
+    plt.figure(figsize=(14, 10))
+
+    # Accuracy comparison
+    plt.subplot(2, 2, 1)
+    accuracies = {name: metrics['accuracy'] for name, (_, metrics, _) in model_results.items()}
+    bars = plt.bar(accuracies.keys(), accuracies.values(), color=['blue', 'green', 'red', 'purple'])
+    plt.title('Model Accuracy Comparison')
+    plt.ylabel('Accuracy')
+    plt.ylim(0.8, 1.0)
+
+    # Add value labels on bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f"{height:.4f}",
+                ha='center', va='bottom')
+
+    # AUC comparison
+    plt.subplot(2, 2, 2)
+    aucs = {name: metrics['auc'] for name, (_, metrics, _) in model_results.items()}
+    bars = plt.bar(aucs.keys(), aucs.values(), color=['blue', 'green', 'red', 'purple'])
+    plt.title('Model AUC-ROC Comparison')
+    plt.ylabel('AUC-ROC')
+    plt.ylim(0.8, 1.0)
+
+    # Add value labels on bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f"{height:.4f}",
+                ha='center', va='bottom')
+
+    # Confusion matrix heatmaps for each model
+    plt.subplot(2, 2, 3)
+    plt.title('Confusion Matrices')
+
+    # Create a 2x2 grid of confusion matrices
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Confusion Matrices by Model Type')
+
+    for i, (name, (_, metrics, _)) in enumerate(model_results.items()):
+        row, col = i // 2, i % 2
+        cm = metrics['confusion_matrix']
+
+        # Calculate percentages
+        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        cm_norm = np.nan_to_num(cm_norm)  # Replace NaN with 0
+
+        # Plot confusion matrix
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, ax=axes[row, col])
+        axes[row, col].set_title(f'{name} Model')
+        axes[row, col].set_xlabel('Predicted labels')
+        axes[row, col].set_ylabel('True labels')
+        axes[row, col].set_xticklabels(['Normal', 'Attack'])
+        axes[row, col].set_yticklabels(['Normal', 'Attack'])
+
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9)
+    plt.show()
+
+    # Print detailed comparison
+    print("\n===== Detailed Model Comparison =====")
+    for name, (_, metrics, _) in model_results.items():
+        print(f"\n{name} Model:")
+        print(f"  Accuracy: {metrics['accuracy']:.4f}")
+        print(f"  AUC-ROC: {metrics['auc']:.4f}")
+
+    # Return the best model name based on AUC
+    best_model_name = max(aucs.items(), key=lambda x: x[1])[0]
+    print(f"\nBest model based on AUC: {best_model_name}")
+
+    return best_model_name
+
+@timing_decorator
+def evaluate_test_set(best_trainer, preprocessor, quantum_mapper, best_model_name, test_df, model_results, y_test=None):
+    """Evaluate the best model on the test set"""
+    print("\n=== Final Evaluation on Test Set ===")
+
+    try:
+        # Transform test data
+        X_test_transformed = preprocessor.transform(test_df)
+
+        # Get the relevant model tuple and PCA from the results dictionary
+        if best_model_name not in model_results:
+            raise KeyError(f"Model '{best_model_name}' not found in model_results")
+
+        trainer, _, model_pca = model_results[best_model_name]
+
+        # Generate quantum features if needed
+        if 'Hybrid' in best_model_name:  # If using the hybrid model
+            X_test_quantum = quantum_mapper.transform(X_test_transformed, batch_size=100)
+            X_test_quantum_features = extract_quantum_features(X_test_quantum)
+            quantum_states_flattened = X_test_quantum.reshape(X_test_quantum.shape[0], -1)
+            X_test_combined = np.hstack([X_test_transformed, quantum_states_flattened, X_test_quantum_features])
+
+            # Apply PCA if it was used during training
+            if model_pca is not None:
+                X_test_final = model_pca.transform(X_test_combined)
+            else:
+                X_test_final = X_test_combined
+
+        elif 'Quantum-Augmented' in best_model_name:
+            X_test_quantum = quantum_mapper.transform(X_test_transformed, batch_size=100)
+            X_test_quantum_features = extract_quantum_features(X_test_quantum)
+            X_test_final = np.hstack([X_test_transformed, X_test_quantum_features])
+
+        elif 'Pure-Quantum' in best_model_name:
+            X_test_quantum = quantum_mapper.transform(X_test_transformed, batch_size=100)
+            X_test_final = extract_quantum_features(X_test_quantum)
+
+        else:  # Classical model
+            X_test_final = X_test_transformed
+
+        # Make predictions using the best trainer
+        y_test_pred = best_trainer.predict(X_test_final)
+
+        # Only calculate metrics if we have test labels
+        if y_test is not None:
+            y_test_prob = best_trainer.predict_proba(X_test_final)[:, 1]
+            test_acc = accuracy_score(y_test, y_test_pred)
+            test_auc = roc_auc_score(y_test, y_test_prob)
+
+            print(f"\nTest Set Performance:")
+            print(f"Accuracy: {test_acc:.4f}")
+            print(f"AUC-ROC: {test_auc:.4f}")
+            print("\nClassification Report:")
+            print(classification_report(y_test, y_test_pred))
+            print("\nConfusion Matrix:")
+            print(confusion_matrix(y_test, y_test_pred))
+
+            return test_acc, test_auc
+        else:
+            print("\nNo test labels available - returning predictions only")
+            return y_test_pred
+
+    except Exception as e:
+        print(f"Error in evaluation: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# ------------------- MAIN PIPELINE -------------------
+
+@timing_decorator
+def run_comprehensive_quantum_ml_pipeline(train_path, test_path):
+    """Run a comprehensive pipeline comparing classical, quantum, and hybrid models"""
+    print("=== Starting Comprehensive Quantum-Classical ML Pipeline ===")
+
+    # Step 1: Load data
+    train_df, test_df = load_data(train_path, test_path)
+
+    # Step 2: Create proper data splits
+    splits = prepare_data_splits(train_df, test_df, target_column)
+
+    # Handle both return cases
+    if len(splits) == 6:
+        X_train, X_val, test_df, y_train, y_val, y_test = splits
+    else:
+        X_train, X_val, test_df, y_train, y_val = splits
+        y_test = None
+
+    # Step 3: Preprocess data
+    preprocessor = Preprocessor(categorical_columns)
+    preprocessor.fit(X_train)
+
+    X_train_proc = preprocessor.transform(X_train)
+    X_val_proc = preprocessor.transform(X_val)
+
+    # Step 4: Train classical model (baseline)
+    print("\n=== Training Classical Model (Baseline) ===")
+    classical_trainer, classical_metrics, _ = train_classical_model(
+        X_train_proc, y_train, X_val_proc, y_val, model_type='xgb'
+    )
+
+    # Step 5: Initialize quantum feature mapper
+    print("\n=== Initializing Quantum Feature Mapper ===")
+    quantum_mapper = QuantumFeatureMapper(circuit_type='basic', num_qubits=8)
+    quantum_mapper.fit(X_train_proc)
+
+    # Step 6: Train different quantum-enhanced models
+    print("\n=== Training Quantum-Enhanced Models ===")
+
+    # Model 1: Quantum-Augmented Model
+    quantum_aug_trainer, quantum_aug_metrics, _ = train_quantum_augmented_model(
+        X_train_proc, y_train, X_val_proc, y_val, quantum_mapper, model_type='xgb'
+    )
+
+    # Model 2: Pure Quantum Model
+    pure_quantum_trainer, pure_quantum_metrics, _ = train_pure_quantum_model(
+        X_train_proc, y_train, X_val_proc, y_val, quantum_mapper, model_type='xgb'
+    )
+
+    # Model 3: Hybrid Model
+    hybrid_trainer, hybrid_metrics, _, hybrid_pca = train_hybrid_model(
+        X_train_proc, y_train, X_val_proc, y_val, quantum_mapper, model_type='xgb'
+    )
+
+    # Step 7: Compare all models
+    print("\n=== Model Comparison ===")
+    model_results = {
+        'Classical': (classical_trainer, classical_metrics, None),
+        'Quantum-Augmented': (quantum_aug_trainer, quantum_aug_metrics, None),
+        'Hybrid': (hybrid_trainer, hybrid_metrics, hybrid_pca),
+        'Pure-Quantum': (pure_quantum_trainer, pure_quantum_metrics, None)
+    }
+
+    best_model_name = visualize_model_comparison(model_results)
+    best_trainer = model_results[best_model_name][0]
+
+    # Step 8: Final evaluation on test set with the best model
+    if y_test is not None:
+        test_acc, test_auc = evaluate_test_set(
+            best_trainer, preprocessor, quantum_mapper, best_model_name, test_df, model_results, y_test
+        )
+        return best_trainer, test_acc, test_auc
+    else:
+        predictions = evaluate_test_set(
+            best_trainer, preprocessor, quantum_mapper, best_model_name, test_df, model_results
+        )
+        return best_trainer, predictions
+
+# ------------------- EXECUTION -------------------
+
+if __name__ == "__main__":
+    # Example paths - replace with your actual dataset paths
+    train_path = "/content/Train_data.csv"
+    test_path = "/content/Test_data.csv"
+
+    # Run the main pipeline
+    result = run_comprehensive_quantum_ml_pipeline(train_path, test_path)
+
+    # Handle the return value based on whether we had test labels
+    if len(result) == 3:
+        best_model, test_acc, test_auc = result
+        print(f"\nFinal Test Results - Accuracy: {test_acc:.4f}, AUC: {test_auc:.4f}")
+    else:
+        best_model, predictions = result
+        print("\nPredictions generated for test set")
